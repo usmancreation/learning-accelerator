@@ -15,6 +15,10 @@ from groq import Groq
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 from docx import Document
+try:
+    import markdown
+except ImportError:
+    markdown = None
 
 
 # ============================================================
@@ -1344,28 +1348,46 @@ def retrieve(query, k=TOP_K):
 
 
 # ---------- AI Agents ----------
-def run_planner_agent(topic, target_date, hours, level, style):
+def run_planner_agent(topic, target_date, hours, level, style, selected_doc=None):
     client = get_client()
     if not client:
         return "System notice: Groq API key is not configured."
 
+    # Retrieve syllabus / course content directly from uploaded material
+    context_str = ""
+    if st.session_state.embeddings_ready and st.session_state.chunks:
+        if selected_doc and selected_doc not in ["All Uploaded Documents", "Custom Subject / General Topic"]:
+            # Gather chunks specifically belonging to the selected document
+            doc_chunks = [c for c, s in zip(st.session_state.chunks, st.session_state.chunk_sources) if s == selected_doc]
+            # Take the initial overview / syllabus chunks of the document
+            sample_chunks = doc_chunks[:8]
+            context_str = "\n\n".join([f"[{selected_doc}]\n{c}" for c in sample_chunks])
+        else:
+            # Retrieve relevant chunks using topic
+            contexts = retrieve(topic, k=6)
+            if contexts:
+                context_str = "\n\n".join([f"[{c['source']}]\n{c['text']}" for c in contexts])
+
     student_name = st.session_state.current_user["name"] if st.session_state.current_user else "Student"
     prompt = f"""
 You are the Curriculum Planner in this academic tutoring system.
-Create an objective, structured study schedule for the following candidate:
+Create a detailed, objective, and structured study schedule for the candidate directly based on the provided course material/syllabus when available.
 
 Candidate: {student_name}
-Subject/Topic: {topic}
+Subject / Target Goal: {topic}
 Target Timeline: {target_date}
 Available Daily Commitment: {hours} hours
 Proficiency Level: {level}
 Preferred Learning Method: {style}
 
+Reference Course Document Content:
+{context_str if context_str else "No uploaded course documents selected. Formulate a structured study plan based on standard academic curriculum."}
+
 Structure your response with:
-1. Executive Summary & Overview
-2. Phased Study Milestones
-3. Daily/Weekly Execution Breakdown
-4. Review Schedule & Practical Exercises
+1. Executive Summary & Syllabus Overview (referencing the specific chapters, topics, and concepts found in the uploaded material)
+2. Phased Study Milestones (divided logically across the target timeline: {target_date})
+3. Daily / Weekly Execution Breakdown (concrete actionable study tasks, reading assignments, and concepts to master)
+4. Review Schedule, Assessment Checkpoints & Practical Exercises
 """
     res = client.chat.completions.create(
         model=st.session_state.model,
@@ -2267,8 +2289,10 @@ elif page == "AI Tutor":
             </div>
             """, unsafe_allow_html=True)
         else:
-            import markdown
-            html_content = markdown.markdown(msg["content"], extensions=['fenced_code', 'tables'])
+            if markdown:
+                html_content = markdown.markdown(msg["content"], extensions=['fenced_code', 'tables'])
+            else:
+                html_content = msg["content"]
             st.markdown(f"""
             <div class="msg-row ai">
                 <div class="msg-avatar ai" style="background:transparent; border:1px solid #e2e8f0; color:#4f46e5;"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a10 10 0 0 1 10 10c0 5.523-4.477 10-10 10S2 17.523 2 12 6.477 2 12 2z"/><path d="M12 16v-4"/><path d="M12 8h.01"/></svg></div>
@@ -2320,9 +2344,33 @@ elif page == "Chat History":
 
 elif page == "Study Planner":
     st.markdown("## Curriculum Planner")
+    
+    # Check if documents are uploaded/indexed
+    unique_docs = []
+    if st.session_state.embeddings_ready and st.session_state.chunk_sources:
+        unique_docs = list(dict.fromkeys(st.session_state.chunk_sources))
+    
     col1, col2 = st.columns(2)
     with col1:
-        topic = st.text_input("Subject / Examination Objective", value="Machine Learning and Neural Networks")
+        if unique_docs:
+            doc_options = unique_docs + ["Custom Subject / General Topic"]
+            selected_doc = st.selectbox(
+                "Source Course Document",
+                options=doc_options,
+                index=0,
+                help="Select an uploaded document to build your study plan directly from its contents."
+            )
+            
+            if selected_doc == "Custom Subject / General Topic":
+                topic = st.text_input("Subject / Examination Objective", value="", placeholder="e.g. Data Structures and Algorithms")
+            else:
+                clean_title = os.path.splitext(selected_doc)[0].replace("_", " ").replace("-", " ").title()
+                topic = st.text_input("Subject / Examination Objective", value=clean_title)
+        else:
+            st.info("💡 **Tip:** Upload your syllabus or course documents in the **Documents** tab to automatically generate a study plan directly from your files.")
+            selected_doc = None
+            topic = st.text_input("Subject / Examination Objective", value="", placeholder="e.g. Machine Learning, Biology, Business Communication")
+
         target = st.text_input("Target Completion Date", value="2 Weeks")
         hours = st.slider("Dedicated Daily Study Hours", 1, 12, 3)
     with col2:
@@ -2330,9 +2378,12 @@ elif page == "Study Planner":
         style = st.selectbox("Pedagogical Preference", ["Structured Examples", "Practical Problem Solving", "Theoretical Frameworks", "Summary Reviews"])
 
     if st.button("Generate Study Plan", type="primary"):
-        with st.spinner("Compiling customized study milestones..."):
-            plan = run_planner_agent(topic, target, hours, level, style)
-            st.session_state.plan = plan
+        if not topic.strip():
+            st.warning("Please specify a subject or select an uploaded course document.")
+        else:
+            with st.spinner("Compiling customized study milestones from your material..."):
+                plan = run_planner_agent(topic, target, hours, level, style, selected_doc=selected_doc)
+                st.session_state.plan = plan
 
     if st.session_state.plan:
         st.divider()
